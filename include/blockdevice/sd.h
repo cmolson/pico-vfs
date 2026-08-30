@@ -18,7 +18,7 @@ extern "C" {
 #include "blockdevice/blockdevice.h"
 
 
-#define CONF_SD_INIT_FREQUENCY    (10 * 1000 * 1000)
+#define CONF_SD_INIT_FREQUENCY  (400 * 1000)
 #define CONF_SD_TRX_FREQUENCY     (24 * MHZ)
 
 /*! \brief Create SD card block device with SPI
