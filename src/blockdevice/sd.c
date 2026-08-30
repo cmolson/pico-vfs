@@ -404,6 +404,14 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
         *resp = response;
     }
 
+    // CMD12's response may contain tail-of-stream bytes, so its R1 is
+    // unreliable; drain until ready and treat stop as best-effort.
+    if (CMD12_STOP_TRANSMISSION == cmd) {
+        _wait_ready(config, SD_COMMAND_TIMEOUT);
+        _postclock_then_deselect(config);
+        return BD_ERROR_OK;
+    }
+
     // Process the response R1  : Exit on CRC/Illegal command error/No response
     if (R1_NO_RESPONSE == response) {
         _postclock_then_deselect(config);
@@ -847,12 +855,15 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
         buffer += config->block_size;
         --block_count;
     }
-    _postclock_then_deselect(config);
-
-    // Send CMD12(0x00000000) to stop the transmission for multi-block transfer
+    // Stop before deselecting: some cards resume streaming on reselect and
+    // their data bytes get misread as the CMD12 response.
     if (size > config->block_size) {
-        status = _cmd(config, CMD12_STOP_TRANSMISSION, 0x0, 0, NULL);
+        int stop_status = _cmd(config, CMD12_STOP_TRANSMISSION, 0x0, 0, NULL);
+        if (BD_ERROR_OK == status) {
+            status = stop_status;
+        }
     }
+    _postclock_then_deselect(config);
 
     mutex_exit(&config->_mutex);
     return status;
