@@ -328,22 +328,10 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
     cmd_packet[3] = (arg >> 8);
     cmd_packet[4] = (arg >> 0);
 
-    if (config->enable_crc) {
-        uint8_t crc = _crc7(cmd_packet, 5);
-        cmd_packet[5] = (crc << 1) | 0x01;
-    } else {
-        switch (cmd) {
-        case CMD0_GO_IDLE_STATE:
-            cmd_packet[5] = 0x95;
-            break;
-        case CMD8_SEND_IF_COND:
-            cmd_packet[5] = 0x87;
-            break;
-        default:
-            cmd_packet[5] = 0xFF;    // Make sure bit 0-End bit is high
-            break;
-        }
-    }
+    // Always send a valid command CRC7: some cards validate it on some
+    // commands even with CRC mode off. enable_crc still governs data CRC16.
+    uint8_t crc = _crc7(cmd_packet, 5);
+    cmd_packet[5] = (crc << 1) | 0x01;
 
     // send a command
     for (int i = 0; i < PACKET_SIZE; i++) {
