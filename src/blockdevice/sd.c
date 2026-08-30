@@ -395,7 +395,9 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
     // CMD12's response may contain tail-of-stream bytes, so its R1 is
     // unreliable; drain until ready and treat stop as best-effort.
     if (CMD12_STOP_TRANSMISSION == cmd) {
-        _wait_ready(config, SD_COMMAND_TIMEOUT);
+        if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
+            debug_if(SD_DBG, "Card not ready after CMD12\n");
+        }
         _postclock_then_deselect(config);
         return BD_ERROR_OK;
     }
@@ -443,8 +445,8 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
             debug_if(SD_DBG, "R3/R7: 0x%" PRIx32 "\n", response);
             break;
 
-        case CMD12_STOP_TRANSMISSION:       // Response R1b
-        case CMD38_ERASE:
+        // CMD12 is handled by the early return above.
+        case CMD38_ERASE:                   // Response R1b
             _wait_ready(config, SD_COMMAND_TIMEOUT);
             break;
 
@@ -948,6 +950,7 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
             response = _write(config, buffer, SPI_START_BLK_MUL_WRITE, config->block_size);
             if (response != SPI_DATA_ACCEPTED) {
                 debug_if(SD_DBG, "Multiple Block Write failed: 0x%x \n", response);
+                status = SD_BLOCK_DEVICE_ERROR_WRITE;
                 break;
             }
             buffer += config->block_size;
