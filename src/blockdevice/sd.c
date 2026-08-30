@@ -584,12 +584,9 @@ static int init_card(void *_config) {
         debug_if(SD_DBG, "Card Initialized: Version 1.x Card\n");
     }
 
-    if (!config->enable_crc) {
-        // Disable CRC
-        status = _cmd(config, CMD59_CRC_ON_OFF, config->enable_crc, 0x0, &response);
-    } else {
-        status = _cmd(config, CMD59_CRC_ON_OFF, 0, 0x0, &response);
-    }
+    // CMD59 arg: 1 = card checks CRC, 0 = off. The else branch sent 0,
+    // silently disabling the CRC mode it was meant to enable.
+    status = _cmd(config, CMD59_CRC_ON_OFF, config->enable_crc ? 1 : 0, 0x0, &response);
     return status;
 }
 
@@ -961,6 +958,12 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
          * of the next block
          */
         _spi_write(config, SPI_STOP_TRAN);
+        // One Nbr byte, then drain busy: without this, program() returns
+        // while the card is still writing and sync() is a no-op.
+        _spi_write(config, SPI_FILL_CHAR);
+        if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
+            debug_if(SD_DBG, "Card not ready after Stop Tran\n");
+        }
     }
 
     _postclock_then_deselect(config);
