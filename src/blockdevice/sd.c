@@ -259,7 +259,9 @@ static void _spi_init(void *_config) {
     gpio_pull_up(config->miso);
     gpio_set_drive_strength(config->mosi, 1);
     gpio_set_drive_strength(config->sclk, 1);
-    spi_init(config->spi_inst, CONF_SD_INIT_FREQUENCY);
+    // DIAG: runtime-selectable identification-phase clock (default = build const)
+    extern uint32_t sd_diag_init_hz;
+    spi_init(config->spi_inst, sd_diag_init_hz ? sd_diag_init_hz : CONF_SD_INIT_FREQUENCY);
     spi_set_format(config->spi_inst, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 
     gpio_put(config->cs, 1);
@@ -316,6 +318,12 @@ static bool _wait_ready(void *_config, uint64_t timeout) {
 
 }
 
+// DIAG hooks
+uint8_t sd_diag_resp_trace[16];
+int sd_diag_resp_trace_n;
+int sd_diag_trace_cmd = -1;
+int sd_diag_force_cmd17;
+
 static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
     blockdevice_sd_config_t *config = _config;
     uint8_t response;
@@ -328,22 +336,11 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
     cmd_packet[3] = (arg >> 8);
     cmd_packet[4] = (arg >> 0);
 
-    if (config->enable_crc) {
-        uint8_t crc = _crc7(cmd_packet, 5);
-        cmd_packet[5] = (crc << 1) | 0x01;
-    } else {
-        switch (cmd) {
-        case CMD0_GO_IDLE_STATE:
-            cmd_packet[5] = 0x95;
-            break;
-        case CMD8_SEND_IF_COND:
-            cmd_packet[5] = 0x87;
-            break;
-        default:
-            cmd_packet[5] = 0xFF;    // Make sure bit 0-End bit is high
-            break;
-        }
-    }
+    // Always send a valid command CRC7: some cards validate it on CMD18
+    // even with CRC mode off, and reject the 0xFF filler with COM_CRC_ERROR.
+    // enable_crc still governs data-block CRC16 checking.
+    uint8_t crc = _crc7(cmd_packet, 5);
+    cmd_packet[5] = (crc << 1) | 0x01;
 
     // send a command
     for (int i = 0; i < PACKET_SIZE; i++) {
@@ -359,8 +356,19 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
     // Loop for response: Response is sent back within command response time (NCR), 0 to 8 bytes for SDC
     for (int i = 0; i < 0x10; i++) {
         spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, &response, 1);
+        if (cmd == sd_diag_trace_cmd && sd_diag_resp_trace_n < 16)
+            sd_diag_resp_trace[sd_diag_resp_trace_n++] = response;
         if (!(response & R1_RESPONSE_RECV)) {
             break;
+        }
+    }
+    // On an error R1, capture what follows too (nothing valid follows, so
+    // the extra clocks are harmless; skipped when R1 is clean).
+    if (cmd == sd_diag_trace_cmd && (response & 0xFE) != 0) {
+        for (int i = 0; i < 6 && sd_diag_resp_trace_n < 16; i++) {
+            uint8_t b;
+            spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, &b, 1);
+            sd_diag_resp_trace[sd_diag_resp_trace_n++] = b;
         }
     }
     return response;
@@ -402,6 +410,16 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
     // Pass the response to the command call if required
     if (NULL != resp) {
         *resp = response;
+    }
+
+    // CMD12's response window may still carry tail-of-stream data bytes on
+    // some cards, so its R1 is unreliable. Stop is best-effort: drain until
+    // the card reports ready and call it success; a genuine wedge surfaces
+    // loudly on the next command.
+    if (CMD12_STOP_TRANSMISSION == cmd) {
+        _wait_ready(config, SD_COMMAND_TIMEOUT);
+        _postclock_then_deselect(config);
+        return BD_ERROR_OK;
     }
 
     // Process the response R1  : Exit on CRC/Illegal command error/No response
@@ -831,6 +849,24 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
         addr = addr / config->block_size;
     }
 
+    // DIAG: forced single-block mode -- one CMD17 per block.
+    if (sd_diag_force_cmd17 && block_count > 1) {
+        while (block_count) {
+            status = _cmd(config, CMD17_READ_SINGLE_BLOCK, addr, 0, NULL);
+            if (BD_ERROR_OK != status) break;
+            if (0 != _read(config, buffer, config->block_size)) {
+                status = SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
+                break;
+            }
+            _postclock_then_deselect(config);
+            buffer += config->block_size;
+            addr += (SDCARD_V2HC == config->card_type) ? 1 : config->block_size;
+            --block_count;
+        }
+        mutex_exit(&config->_mutex);
+        return status;
+    }
+
     // Write command ro receive data
     if (block_count > 1) {
         status = _cmd(config, CMD18_READ_MULTIPLE_BLOCK, addr, 0, NULL);
@@ -851,12 +887,16 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
         buffer += config->block_size;
         --block_count;
     }
-    _postclock_then_deselect(config);
-
-    // Send CMD12(0x00000000) to stop the transmission for multi-block transfer
+    // Stop the transmission BEFORE releasing the card: deselecting mid-stream
+    // leaves some cards still streaming on reselect, and their data bytes get
+    // misread as the CMD12 response. Never let CMD12 clobber the read status.
     if (size > config->block_size) {
-        status = _cmd(config, CMD12_STOP_TRANSMISSION, 0x0, 0, NULL);
+        int stop_status = _cmd(config, CMD12_STOP_TRANSMISSION, 0x0, 0, NULL);
+        if (BD_ERROR_OK == status) {
+            status = stop_status;
+        }
     }
+    _postclock_then_deselect(config);
 
     mutex_exit(&config->_mutex);
     return status;
