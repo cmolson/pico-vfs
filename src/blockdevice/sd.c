@@ -18,6 +18,14 @@
 #include <pico/stdlib.h>
 #include "blockdevice/sd.h"
 
+/* Some newlib builds fail to expose the PRI*64 macros. Only used in debug strings. */
+#ifndef PRIx64
+#define PRIx64 "llx"
+#endif
+#ifndef PRIu64
+#define PRIu64 "llu"
+#endif
+
 typedef struct {
     spi_inst_t *spi_inst;
     uint8_t mosi; // PICO_DEFAULT_SPI_TX_PIN  pin 19
