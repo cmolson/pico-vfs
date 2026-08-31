@@ -323,6 +323,7 @@ uint8_t sd_diag_resp_trace[16];
 int sd_diag_resp_trace_n;
 int sd_diag_trace_cmd = -1;
 int sd_diag_force_cmd17;
+int sd_diag_legacy_cmd12;   // 1 = upstream behavior: deselect first, strict R1
 
 static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
     blockdevice_sd_config_t *config = _config;
@@ -412,11 +413,9 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
         *resp = response;
     }
 
-    // CMD12's response window may still carry tail-of-stream data bytes on
-    // some cards, so its R1 is unreliable. Stop is best-effort: drain until
-    // the card reports ready and call it success; a genuine wedge surfaces
-    // loudly on the next command.
-    if (CMD12_STOP_TRANSMISSION == cmd) {
+    // CMD12's response may contain tail-of-stream bytes, so its R1 is
+    // unreliable; drain until ready and treat stop as best-effort.
+    if (CMD12_STOP_TRANSMISSION == cmd && !sd_diag_legacy_cmd12) {
         _wait_ready(config, SD_COMMAND_TIMEOUT);
         _postclock_then_deselect(config);
         return BD_ERROR_OK;
@@ -887,16 +886,23 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
         buffer += config->block_size;
         --block_count;
     }
-    // Stop the transmission BEFORE releasing the card: deselecting mid-stream
-    // leaves some cards still streaming on reselect, and their data bytes get
-    // misread as the CMD12 response. Never let CMD12 clobber the read status.
-    if (size > config->block_size) {
-        int stop_status = _cmd(config, CMD12_STOP_TRANSMISSION, 0x0, 0, NULL);
-        if (BD_ERROR_OK == status) {
-            status = stop_status;
+    // Stop before deselecting: some cards resume streaming on reselect and
+    // their data bytes get misread as the CMD12 response. The legacy path
+    // reproduces upstream (deselect first, CMD12 status clobbers the read).
+    if (sd_diag_legacy_cmd12) {
+        _postclock_then_deselect(config);
+        if (size > config->block_size) {
+            status = _cmd(config, CMD12_STOP_TRANSMISSION, 0x0, 0, NULL);
         }
+    } else {
+        if (size > config->block_size) {
+            int stop_status = _cmd(config, CMD12_STOP_TRANSMISSION, 0x0, 0, NULL);
+            if (BD_ERROR_OK == status) {
+                status = stop_status;
+            }
+        }
+        _postclock_then_deselect(config);
     }
-    _postclock_then_deselect(config);
 
     mutex_exit(&config->_mutex);
     return status;
